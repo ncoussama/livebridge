@@ -9,51 +9,61 @@ import android.graphics.RectF
 import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
-import android.graphics.drawable.Icon
 import android.util.LruCache
 import kotlin.math.roundToInt
 
 /**
- * Builds a full-bleed ADAPTIVE large icon from an app's own launcher icon.
+ * Builds a clean, FULL-BLEED, fully OPAQUE square bitmap from an app's own launcher icon, to be
+ * used as the notification's large icon.
  *
- * Why: the large icon used to be a plain, already-masked bitmap (rounded corners + transparent
- * pixels). One UI treats such a bitmap as a "legacy" icon: it shrinks it and puts it on a white
- * tile, and in the Now Bar the transparent/antialiased edge lets white pixels show through.
- * An adaptive icon is masked by the system itself, so it fills the whole slot.
+ * It stays an ordinary Bitmap on purpose: One UI accepts it exactly like the bitmap LiveBridge
+ * always sent, so the app icon keeps showing in notifications and the Now Bar. (A previous
+ * attempt handed over an "adaptive bitmap" Icon; One UI ignored it and fell back to LiveBridge's
+ * own icon.)
+ *
+ * What changes compared with the old bitmap:
+ *  - it is drawn from the app's raw icon layers, so One UI's icon framing (white tile, shrunk
+ *    icon, squircle with transparent corners) is not baked into it;
+ *  - it has no transparent or half-transparent pixels, so no white fringe can show through;
+ *  - it is a plain square: the system itself rounds it (notification) or crops it (Now Bar circle).
  *
  * Only the app's own icon is converted. Avatars, album art, navigation arrows and every other
  * source bitmap are left exactly as they were, and on ANY failure this returns null so the caller
  * keeps the old behaviour.
  */
 internal object AdaptiveAppIcon {
-    // The bitmap stands for the 108dp adaptive canvas; the system shows its centre 72dp.
-    private const val SIZE_DP = 96f
+    private const val SIZE_DP = 80f
     private const val MIN_SIZE_PX = 192
-    private const val MAX_SIZE_PX = 432
-    private const val LEGACY_ICON_FRACTION = 0.62f
+    private const val MAX_SIZE_PX = 384
+
+    // An adaptive icon is a 108dp canvas of which only the centre 72dp is visible.
+    // Drawing the layers 1.5x larger than the bitmap, centred, shows exactly that window.
+    private const val LAYER_OVERSCAN = 0.25f
+
+    // Legacy (non-adaptive) icons are drawn at this share of the square.
+    private const val LEGACY_ICON_FRACTION = 0.80f
 
     private val bitmaps = object : LruCache<String, Bitmap>(4 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
     }
 
     /**
-     * Returns an adaptive [Icon] ONLY when [chosen] is the app's own icon bitmap
+     * Returns a full-bleed opaque bitmap ONLY when [chosen] is the app's own icon bitmap
      * (the one AppMetadataCache hands out). For anything else it returns null.
      */
-    fun forLargeIcon(context: Context, packageName: String, chosen: Bitmap?): Icon? {
+    fun forLargeIcon(context: Context, packageName: String, chosen: Bitmap?): Bitmap? {
         if (chosen == null) return null
         return try {
             val appIcon = AppMetadataCache.get(context, packageName).largeIcon ?: return null
             if (chosen !== appIcon && !chosen.sameAs(appIcon)) return null
-            val bitmap = adaptiveBitmap(context, packageName) ?: return null
-            Icon.createWithAdaptiveBitmap(bitmap)
+            iconBitmap(context, packageName)
         } catch (_: Throwable) {
             null
         }
     }
 
     @Synchronized
-    private fun adaptiveBitmap(context: Context, packageName: String): Bitmap? {
+    private fun iconBitmap(context: Context, packageName: String): Bitmap? {
         val appContext = context.applicationContext
         val size = (SIZE_DP * appContext.resources.displayMetrics.density)
             .roundToInt()
@@ -76,31 +86,34 @@ internal object AdaptiveAppIcon {
         val canvas = Canvas(bitmap)
 
         if (drawable is AdaptiveIconDrawable) {
-            // Draw the raw 108dp layers (no mask) so the system can mask them itself.
             val background = drawable.background
             val foreground = drawable.foreground
             if (background == null && foreground == null) return null
-            background?.let { drawLayer(canvas, it, size) }
-            foreground?.let { drawLayer(canvas, it, size) }
-            return bitmap
+            // Opaque base first, so nothing underneath can ever be transparent.
+            canvas.drawColor(Color.WHITE)
+            val overscan = (size * LAYER_OVERSCAN).roundToInt()
+            background?.let { drawLayer(canvas, it, size, overscan) }
+            foreground?.let { drawLayer(canvas, it, size, overscan) }
+        } else {
+            // Legacy (non-adaptive) icon: centre it on a backdrop taken from its own edge.
+            val legacy = drawableToBitmap(drawable) ?: return null
+            canvas.drawColor(edgeColor(legacy))
+            val side = size * LEGACY_ICON_FRACTION
+            val offset = (size - side) / 2f
+            canvas.drawBitmap(
+                legacy,
+                null,
+                RectF(offset, offset, offset + side, offset + side),
+                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            )
         }
-
-        // Legacy (non-adaptive) icon: put it in the visible window on a backdrop taken from its edge.
-        val legacy = drawableToBitmap(drawable) ?: return null
-        canvas.drawColor(edgeColor(legacy))
-        val side = size * LEGACY_ICON_FRACTION
-        val offset = (size - side) / 2f
-        canvas.drawBitmap(
-            legacy,
-            null,
-            RectF(offset, offset, offset + side, offset + side),
-            Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        )
+        // Every pixel is opaque: say so, so the system never treats it as a see-through icon.
+        bitmap.setHasAlpha(false)
         return bitmap
     }
 
-    private fun drawLayer(canvas: Canvas, layer: Drawable, size: Int) {
-        layer.setBounds(0, 0, size, size)
+    private fun drawLayer(canvas: Canvas, layer: Drawable, size: Int, overscan: Int) {
+        layer.setBounds(-overscan, -overscan, size + overscan, size + overscan)
         layer.draw(canvas)
     }
 
