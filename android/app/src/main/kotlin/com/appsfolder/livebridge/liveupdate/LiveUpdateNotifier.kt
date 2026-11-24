@@ -1922,8 +1922,13 @@ object LiveUpdateNotifier {
                 }
         }
         applySmallIcon(context, builder, preferredSmallIcon)
-        preferredLargeIcon?.let(builder::setLargeIcon)
-
+        val adaptiveAppLargeIcon =
+    AdaptiveAppIcon.forLargeIcon(context, sbn.packageName, preferredLargeIcon)
+val adaptiveApplied = adaptiveAppLargeIcon != null &&
+        runCatching { builder.setLargeIcon(adaptiveAppLargeIcon) }.isSuccess
+if (!adaptiveApplied) {
+    preferredLargeIcon?.let(builder::setLargeIcon)
+}
         if (requestPromoted) {
             builder.setRequestPromotedOngoing(true)
         }
